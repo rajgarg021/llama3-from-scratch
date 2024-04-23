@@ -5,6 +5,7 @@ from torch.nn import functional as F
 from dataclasses import dataclass
 from typing import Optional
 
+
 @dataclass
 class ModelArguments:
     n_embeddings: int = 4096 # input embedding dimension
@@ -20,6 +21,22 @@ class ModelArguments:
     max_seq_length: int = 2048 # needed for KV cache
 
     device: str = 'cuda' if torch.cuda.is_available() else 'cpu'
+
+
+class RMSNorm(nn.Module):
+    """ Root Mean Square Layer Normalization """
+
+    def __init__(self, n_embeddings: int, eps: float = 1e-6):
+        super().__init__()
+        self.eps = eps
+        self.gamma = nn.Parameter(torch.ones(n_embeddings)) # gamma parameter
+    
+    def _norm(self, x: torch.tensor):
+        return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps) # (B, seq_len, n_embeddings)
+
+    def forward(self, x: torch.tensor):
+        return self.gamma * self._norm(x.float()).type_as(x) # (n_embeddings) * (B, seq_len, n_embeddings) --> (B, seq_len, n_embeddings)
+
 
 def precompute_freqs_complex(head_size: int, seq_len: int, device: str, theta: float = 10000.0):
     """ Precomputing the frequency tensor with complex exponentials for the given sequence length and dimensions """
@@ -37,6 +54,7 @@ def precompute_freqs_complex(head_size: int, seq_len: int, device: str, theta: f
 
     return freqs_complex
 
+
 def apply_rotary_position_embeddings(x: torch.tensor, freqs_complex: torch.tensor, device: str):
     """  Applying rotary position embeddings to input tensors using the given frequency tensor """
 
@@ -53,17 +71,13 @@ def apply_rotary_position_embeddings(x: torch.tensor, freqs_complex: torch.tenso
     
     return x_out.type_as(x).to(device)
 
-class RMSNorm(nn.Module):
-    """ Root-Mean Squared Normalization """
-
-    def __init__(self):
-        raise NotImplementedError
-
+         
 class TransformerBlock(nn.Module):
     """ Transformer block: communication followed by computation """
     
     def __init__(self):
         raise NotImplementedError
+
 
 class Transformer(nn.Module):
 
@@ -87,7 +101,7 @@ class Transformer(nn.Module):
         # adding this multiplier instead of using 4096 directly allows for dynamism of token lengths while training or fine-tuning
         self.freqs_complex = precompute_freqs_complex(self.params.n_embeddings // self.params.n_heads, self.params.max_seq_length * 2, device=self.params.device)
 
-    def forward(self, tokens: torch.Tensor, start_pos: int):
+    def forward(self, tokens: torch.tensor, start_pos: int):
         # tokens is a (batch_size (B), sequence_length (seq_len)) tensor of integers
         B, seq_len = tokens.shape
         assert seq_len == 1, "only one token at a time can be processed"

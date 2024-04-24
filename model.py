@@ -154,8 +154,26 @@ class Attention(nn.Module):
 
 
 class FeedForward(nn.Module):
-    def __init__(self):
-        raise NotImplementedError
+    """ Feed forward with SwiGLU """
+
+    def __init__(self, params: ModelArguments):
+        super().__init__()
+        hidden_dim = 4 * params.n_embeddings
+        hidden_dim = int(2 * hidden_dim / 3)
+        if params.ffn_dim_multiplier is not None:
+            hidden_dim = int(params.ffn_dim_multiplier * hidden_dim)
+        # rounding the hidden_dim to the nearest multiple of the multiple_of parameter
+        hidden_dim = params.multiple_of * ((hidden_dim + params.multiple_of - 1) // params.multiple_of)
+
+        self.w1 = nn.Linear(params.n_embeddings, hidden_dim, bias=False)
+        self.w2 = nn.Linear(hidden_dim, params.n_embeddings, bias=False)
+        self.w3 = nn.Linear(params.n_embeddings, hidden_dim, bias=False)
+
+        def forward(self, x: torch.tensor):
+            # in SwiGLU, the Swish function is used to gate the linear function of GLU
+            # swish(x) = x * sigmoid(beta * x)
+            # when beta = 1, swish function becomes same as the sigmoid linear unit function (SiLU)
+            return self.w2(F.silu(self.w1(x)) * self.w3(x))
 
 
 class TransformerBlock(nn.Module):

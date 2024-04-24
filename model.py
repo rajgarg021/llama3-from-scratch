@@ -6,7 +6,7 @@ from typing import Optional
 
 
 @dataclass
-class ModelArguments:
+class ModelArgs:
     """ Important parameters of our model """
 
     n_embeddings: int = 4096 # input embedding dimension
@@ -74,7 +74,7 @@ def apply_rotary_position_embeddings(x: torch.tensor, freqs_complex: torch.tenso
 
 
 def repeat_kv(x: torch.tensor, n_repeat: int):
-    """ Repeating the heads of keys and values to match the number of query heads"""
+    """ Repeating the heads of keys and values to match the number of query heads """
 
     B, seq_len_kv, n_kv_heads, head_size = x.shape
     if n_repeat == 1:
@@ -90,7 +90,7 @@ def repeat_kv(x: torch.tensor, n_repeat: int):
 class Attention(nn.Module):
     """ Grouped-Query Attention using KV cache with RoPE applied to queries and keys """
 
-    def __init__(self, head_size: int, params: ModelArguments):
+    def __init__(self, head_size: int, params: ModelArgs):
         super().__init__()
 
         self.head_size = head_size
@@ -156,7 +156,7 @@ class Attention(nn.Module):
 class FeedForward(nn.Module):
     """ Feed forward with SwiGLU """
 
-    def __init__(self, params: ModelArguments):
+    def __init__(self, params: ModelArgs):
         super().__init__()
         hidden_dim = 4 * params.n_embeddings
         hidden_dim = int(2 * hidden_dim / 3)
@@ -179,7 +179,7 @@ class FeedForward(nn.Module):
 class TransformerBlock(nn.Module):
     """ Transformer block: communication followed by computation """
     
-    def __init__(self, head_size: int, params: ModelArguments):
+    def __init__(self, head_size: int, params: ModelArgs):
         super().__init__()
 
         self.head_size = head_size
@@ -204,7 +204,7 @@ class TransformerBlock(nn.Module):
 class Transformer(nn.Module):
     """ Transformer module """
 
-    def __init__(self, params = ModelArguments):
+    def __init__(self, params = ModelArgs):
         super().__init__()
 
         assert params.vocab_size != -1, "vocab must be set, cannot be equal to -1"

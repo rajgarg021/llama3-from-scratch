@@ -1,4 +1,3 @@
-import math
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
@@ -8,6 +7,8 @@ from typing import Optional
 
 @dataclass
 class ModelArguments:
+    """ Important parameters of our model """
+
     n_embeddings: int = 4096 # input embedding dimension
     n_layers: int = 32 # number of times the transformer block is repeated
     n_heads: int = 32 # number of heads for Queries
@@ -71,7 +72,87 @@ def apply_rotary_position_embeddings(x: torch.tensor, freqs_complex: torch.tenso
     
     return x_out.type_as(x).to(device)
 
-         
+
+def repeat_kv(x: torch.tensor, n_repeat: int):
+    """ Repeating the heads of keys and values to match the number of query heads"""
+
+    B, seq_len_kv, n_kv_heads, head_size = x.shape
+    if n_repeat == 1:
+        return x
+    else:
+        return (
+            x[:, :, :, None, :] # (B, seq_len, n_kv_heads, 1, head_size), added a new dimension
+            .expand(B, seq_len_kv, n_kv_heads, n_repeat, head_size)
+            .reshape(B, seq_len_kv, n_kv_heads * n_repeat, head_size)
+        )
+    
+
+class Attention(nn.Module):
+    """ Grouped-Query Attention using KV cache with RoPE applied to queries and keys """
+
+    def __init__(self, head_size: int, params: ModelArguments):
+        super().__init__()
+
+        self.head_size = head_size
+        # number of heads for keys and values
+        self.n_kv_heads = params.n_heads if params.n_kv_heads is None else params.n_kv_heads
+        # number of heads for queries
+        self.n_q_heads = params.n_heads
+        # number of times keys and values should be repeated
+        self.n_repeat = self.n_q_heads // self.n_kv_heads
+
+        self.wq = nn.Linear(params.n_embeddings, self.n_q_heads * self.head_size, bias=False)
+        self.wk = nn.Linear(params.n_embeddings, self.n_kv_heads * self.head_size, bias=False)
+        self.wv = nn.Linear(params.n_embeddings, self.n_kv_heads * self.head_size, bias=False)
+        self.wo = nn.Linear(params.n_heads * self.head_size, params.n_embeddings, bias=False)
+
+        self.cache_k = torch.zeros((params.max_batch_size, params.max_seq_length, self.n_kv_heads, head_size))
+        self.cache_v = torch.zeros((params.max_batch_size, params.max_seq_length, self.n_kv_heads, head_size))
+        
+    def forward(self, x: torch.tensor, start_pos: int, freqs_complex: torch.tensor):
+        B, seq_len, C = x.shape # (batch_size, 1, n_embeddings)
+
+        xq = self.wq(x) # (B, 1, n_embeddings) --> (B, 1, n_q_heads * head_size)
+        xk = self.wk(x) # (B, 1, n_embeddings) --> (B, 1, n_kv_heads * head_size)
+        xv = self.wv(x) # (B, 1, n_embeddings) --> (B, 1, b_kv_heads * head_size)
+
+        xq = xq.view(B, seq_len, self.n_q_heads, self.head_size) # (B, 1, n_q_heads * head_size) --> (B, 1, n_q_heads, head_size)
+        xk = xk.view(B, seq_len, self.n_kv_heads, self.head_size) # (B, 1, n_kv_heads * head_size) --> (B, 1, n_kv_heads, head_size)
+        xv = xv.view(B, seq_len, self.n_kv_heads, self.head_size) # (B, 1, n_kv_heads * head_size) --> (B, 1, n_kv_heads, head_size)
+
+        xq = apply_rotary_position_embeddings(xq, freqs_complex, device=x.device) # (B, 1, n_q_heads, head_size)
+        xk = apply_rotary_position_embeddings(xk, freqs_complex, device=x.device) # (B, 1, n_kv_heads, head_size)
+        
+        # replacing the entry for this token in the cache
+        self.cache_k[:B, start_pos:start_pos+seq_len] = xk
+        self.cache_v[:B, start_pos:start_pos+seq_len] = xv
+        
+        # retrieving all the cached keys and values so far
+        keys = self.cache_k[:B, 0:start_pos+seq_len] # (B, seq_len_kv, n_kv_heads, head_size)
+        values = self.cache_v[:B, 0:start_pos+seq_len] # (B, seq_len_kv, n_kv_heads, head_size)
+
+        # repeating the heads of keys and values to match the number of query heads
+        # repeating the heads is not the most optimal way but this is how META has done it too
+        keys = repeat_kv(keys, self.n_repeat)
+        values = repeat_kv(values, self.n_repeat)
+
+        xq = xq.transpose(1, 2) # (B, 1, n_q_heads, head_size) --> (B, n_q_heads, 1, head_size)
+        keys = keys.transpose(1, 2) # (B, seq_len_kv, n_q_heads, head_size) --> (B, n_q_heads, seq_len_kv, head_size)
+        values = values.transpose(1, 2) # (B, seq_len_kv, n_q_heads, head_size) --> (B, n_q_heads, seq_len_kv, head_size)
+
+        # computing attention scores
+        scores = xq @ keys.transpose(2, 3) * self.head_size**-0.5 # (B, n_q_heads, 1, head_size) @ (B, n_q_heads, head_size, seq_len_kv) --> (B, n_q_heads, 1, seq_len_kv)
+        scores = F.softmax(scores.float(), dim=-1).type_as(xq)
+
+        # taking weighted aggregation of values
+        output = scores @ values # (B, n_q_heads, 1, seq_len_kv) @ (B, n_q_heads, seq_len_kv, head_size) --> (B, n_q_heads, 1, head_size)
+        # concatenating outputs from all the heads
+        output = (output.transpose(1, 2).contiguous().view(B, seq_len, -1)) # (B, n_q_heads, 1, head_size) --> (B, n_q_heads, head_size, 1) --> (B, 1, n_heads * head_size)
+        output = self.wo(output) # (B, 1, n_heads * head_size) --> (B, 1, n_embeddings)
+
+        return output
+
+
 class TransformerBlock(nn.Module):
     """ Transformer block: communication followed by computation """
     
@@ -90,6 +171,7 @@ class Transformer(nn.Module):
         self.vocab_size = params.vocab_size
         self.n_layers = params.n_layers
         self.tok_embeddings = nn.Embedding(self.vocab_size, params.n_embeddings)
+        self.head_size = self.params.n_embeddings // self.params.n_heads
 
         # interspersing communcation and computation by replicating the transformer block sequentially  
         self.layers = nn.Sequential(*[TransformerBlock(params) for _ in range(params.n_layers)])
@@ -99,7 +181,7 @@ class Transformer(nn.Module):
 
         # note that self.params.max_seq_len is multiplied by 2 because the token limit for the Llama 2 generation of models is 4096
         # adding this multiplier instead of using 4096 directly allows for dynamism of token lengths while training or fine-tuning
-        self.freqs_complex = precompute_freqs_complex(self.params.n_embeddings // self.params.n_heads, self.params.max_seq_length * 2, device=self.params.device)
+        self.freqs_complex = precompute_freqs_complex(self.head_size, self.params.max_seq_length * 2, device=self.params.device)
 
     def forward(self, tokens: torch.tensor, start_pos: int):
         # tokens is a (batch_size (B), sequence_length (seq_len)) tensor of integers
@@ -117,16 +199,4 @@ class Transformer(nn.Module):
         logits = self.lm_head(x).float() # (B, seq_len, vocab_size)
 
         return logits
-    
-
-
-
-
-
-
-
-
-    
-
-
     

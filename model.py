@@ -153,16 +153,40 @@ class Attention(nn.Module):
         return output
 
 
-class TransformerBlock(nn.Module):
-    """ Transformer block: communication followed by computation """
-    
+class FeedForward(nn.Module):
     def __init__(self):
         raise NotImplementedError
 
 
-class Transformer(nn.Module):
+class TransformerBlock(nn.Module):
+    """ Transformer block: communication followed by computation """
+    
+    def __init__(self, head_size: int, params: ModelArguments):
+        super().__init__()
 
-    def __init__(self, params = ModelArguments) -> None:
+        self.head_size = head_size
+        self.params = params
+        self.n_heads = params.n_heads
+        self.attention = Attention(head_size, params)
+        self.ffwd = FeedForward(params)
+
+        # normalization before self attention
+        self.attention_norm = RMSNorm(params.n_embeddings, eps=params.norm_eps)
+        # normalization before the feed forward block
+        self.ffwd_norm = RMSNorm(params.n_embeddings, eps=params.norm_eps)
+
+        def forward(self, x: torch.tensor, start_pos: int, freqs_complex: torch.tensor):
+            # residual connections and root mean square layer normalization
+            h = x + self.attention.forward(self.attention_norm(x), start_pos, freqs_complex) # (B, seq_len, n_embeddings) + (B, seq_len, n_embeddings) --> (B, seq_len, n_embeddings)
+            output = h + self.ffwd.forward(self.ffwd_norm(h))  # (B, seq_len, n_embeddings) + (B, seq_len, n_embeddings) --> (B, seq_len, n_embeddings)
+
+            return output
+        
+
+class Transformer(nn.Module):
+    """ Transformer module """
+
+    def __init__(self, params = ModelArguments):
         super().__init__()
 
         assert params.vocab_size != -1, "vocab must be set, cannot be equal to -1"
@@ -174,7 +198,7 @@ class Transformer(nn.Module):
         self.head_size = self.params.n_embeddings // self.params.n_heads
 
         # interspersing communcation and computation by replicating the transformer block sequentially  
-        self.layers = nn.Sequential(*[TransformerBlock(params) for _ in range(params.n_layers)])
+        self.layers = nn.Sequential(*[TransformerBlock(self.head_size, params) for _ in range(params.n_layers)])
 
         self.norm = RMSNorm(params.n_embeddings, eps=params.norm_eps)
         self.lm_head = nn.Linear(params.n_embeddings, self.vocab_size)

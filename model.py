@@ -19,7 +19,7 @@ class ModelArgs:
     norm_eps: float = 1e-5 # small value added to the denominator in RMSNorm for numerical stability
 
     max_batch_size: int = 32 # needed for KV cache
-    max_seq_length: int = 2048 # needed for KV cache
+    max_seq_len: int = 2048 # needed for KV cache
 
     device: str = 'cuda' if torch.cuda.is_available() else 'cpu'
 
@@ -106,8 +106,8 @@ class Attention(nn.Module):
         self.wv = nn.Linear(params.n_embeddings, self.n_kv_heads * self.head_size, bias=False)
         self.wo = nn.Linear(params.n_heads * self.head_size, params.n_embeddings, bias=False)
 
-        self.cache_k = torch.zeros((params.max_batch_size, params.max_seq_length, self.n_kv_heads, head_size))
-        self.cache_v = torch.zeros((params.max_batch_size, params.max_seq_length, self.n_kv_heads, head_size))
+        self.cache_k = torch.zeros((params.max_batch_size, params.max_seq_len, self.n_kv_heads, head_size))
+        self.cache_v = torch.zeros((params.max_batch_size, params.max_seq_len, self.n_kv_heads, head_size))
         
     def forward(self, x: torch.tensor, start_pos: int, freqs_complex: torch.tensor):
         B, seq_len, C = x.shape # (batch_size, 1, n_embeddings)
@@ -223,7 +223,7 @@ class Transformer(nn.Module):
 
         # note that self.params.max_seq_len is multiplied by 2 because the token limit for the Llama 2 generation of models is 4096
         # adding this multiplier instead of using 4096 directly allows for dynamism of token lengths while training or fine-tuning
-        self.freqs_complex = precompute_freqs_complex(self.head_size, self.params.max_seq_length * 2, device=self.params.device)
+        self.freqs_complex = precompute_freqs_complex(self.head_size, self.params.max_seq_len * 2, device=self.params.device)
 
     def forward(self, tokens: torch.tensor, start_pos: int):
         # tokens is a (batch_size (B), sequence_length (seq_len)) tensor of integers

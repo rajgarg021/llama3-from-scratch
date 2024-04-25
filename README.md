@@ -1,2 +1,2 @@
-# llama2-from-scratch
-Implementing LLaMA 2 from scratch in PyTorch
+# llama3-from-scratch
+Clean inference code for LLaMA-3 with lots of comments explaining every step

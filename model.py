@@ -9,7 +9,7 @@ from typing import Optional
 class ModelArgs:
     """ Important parameters of our model """
 
-    n_embeddings: int = 4096 # input embedding dimension
+    dim: int = 4096 # input embedding dimension
     n_layers: int = 32 # number of times the transformer block is repeated
     n_heads: int = 32 # number of heads for Queries
     n_kv_heads: Optional[int] = None # number of heads for Keys and Values
@@ -17,6 +17,7 @@ class ModelArgs:
     multiple_of: int = 256  # make SwiGLU hidden layer size multiple of large power of 2
     ffn_dim_multiplier: Optional[float] = None
     norm_eps: float = 1e-5 # small value added to the denominator in RMSNorm for numerical stability
+    rope_theta: float = 500000 # scaling factor for frequency computation in RoPE
 
     max_batch_size: int = 32 # needed for KV cache
     max_seq_len: int = 2048 # needed for KV cache
@@ -27,16 +28,16 @@ class ModelArgs:
 class RMSNorm(nn.Module):
     """ Root Mean Square Layer Normalization """
 
-    def __init__(self, n_embeddings: int, eps: float = 1e-6):
+    def __init__(self, dim: int, eps: float = 1e-6):
         super().__init__()
         self.eps = eps
-        self.gamma = nn.Parameter(torch.ones(n_embeddings)) # gamma parameter
+        self.weight = nn.Parameter(torch.ones(dim)) # gamma parameter
     
     def _norm(self, x: torch.tensor):
-        return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps) # (B, seq_len, n_embeddings)
+        return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps) # (B, seq_len, dim)
 
     def forward(self, x: torch.tensor):
-        return self.gamma * self._norm(x.float()).type_as(x) # (n_embeddings) * (B, seq_len, n_embeddings) --> (B, seq_len, n_embeddings)
+        return self.weight * self._norm(x.float()).type_as(x) # (dim) * (B, seq_len, dim) --> (B, seq_len, dim)
 
 
 def precompute_freqs_complex(head_size: int, seq_len: int, device: str, theta: float = 10000.0):
@@ -101,20 +102,20 @@ class Attention(nn.Module):
         # number of times keys and values should be repeated
         self.n_repeat = self.n_q_heads // self.n_kv_heads
 
-        self.wq = nn.Linear(params.n_embeddings, self.n_q_heads * self.head_size, bias=False)
-        self.wk = nn.Linear(params.n_embeddings, self.n_kv_heads * self.head_size, bias=False)
-        self.wv = nn.Linear(params.n_embeddings, self.n_kv_heads * self.head_size, bias=False)
-        self.wo = nn.Linear(params.n_heads * self.head_size, params.n_embeddings, bias=False)
+        self.wq = nn.Linear(params.dim, self.n_q_heads * self.head_size, bias=False)
+        self.wk = nn.Linear(params.dim, self.n_kv_heads * self.head_size, bias=False)
+        self.wv = nn.Linear(params.dim, self.n_kv_heads * self.head_size, bias=False)
+        self.wo = nn.Linear(params.n_heads * self.head_size, params.dim, bias=False)
 
         self.cache_k = torch.zeros((params.max_batch_size, params.max_seq_len, self.n_kv_heads, head_size))
         self.cache_v = torch.zeros((params.max_batch_size, params.max_seq_len, self.n_kv_heads, head_size))
         
     def forward(self, x: torch.tensor, start_pos: int, freqs_complex: torch.tensor):
-        B, seq_len, C = x.shape # (batch_size, 1, n_embeddings)
+        B, seq_len, C = x.shape # (batch_size, 1, dim)
 
-        xq = self.wq(x) # (B, 1, n_embeddings) --> (B, 1, n_q_heads * head_size)
-        xk = self.wk(x) # (B, 1, n_embeddings) --> (B, 1, n_kv_heads * head_size)
-        xv = self.wv(x) # (B, 1, n_embeddings) --> (B, 1, b_kv_heads * head_size)
+        xq = self.wq(x) # (B, 1, dim) --> (B, 1, n_q_heads * head_size)
+        xk = self.wk(x) # (B, 1, dim) --> (B, 1, n_kv_heads * head_size)
+        xv = self.wv(x) # (B, 1, dim) --> (B, 1, b_kv_heads * head_size)
 
         xq = xq.view(B, seq_len, self.n_q_heads, self.head_size) # (B, 1, n_q_heads * head_size) --> (B, 1, n_q_heads, head_size)
         xk = xk.view(B, seq_len, self.n_kv_heads, self.head_size) # (B, 1, n_kv_heads * head_size) --> (B, 1, n_kv_heads, head_size)
@@ -148,7 +149,7 @@ class Attention(nn.Module):
         output = scores @ values # (B, n_q_heads, 1, seq_len_kv) @ (B, n_q_heads, seq_len_kv, head_size) --> (B, n_q_heads, 1, head_size)
         # concatenating outputs from all the heads
         output = (output.transpose(1, 2).contiguous().view(B, seq_len, -1)) # (B, n_q_heads, 1, head_size) --> (B, n_q_heads, head_size, 1) --> (B, 1, n_heads * head_size)
-        output = self.wo(output) # (B, 1, n_heads * head_size) --> (B, 1, n_embeddings)
+        output = self.wo(output) # (B, 1, n_heads * head_size) --> (B, 1, dim)
 
         return output
 
@@ -158,16 +159,16 @@ class FeedForward(nn.Module):
 
     def __init__(self, params: ModelArgs):
         super().__init__()
-        hidden_dim = 4 * params.n_embeddings
+        hidden_dim = 4 * params.dim
         hidden_dim = int(2 * hidden_dim / 3)
         if params.ffn_dim_multiplier is not None:
             hidden_dim = int(params.ffn_dim_multiplier * hidden_dim)
         # rounding the hidden_dim to the nearest multiple of the multiple_of parameter
         hidden_dim = params.multiple_of * ((hidden_dim + params.multiple_of - 1) // params.multiple_of)
 
-        self.w1 = nn.Linear(params.n_embeddings, hidden_dim, bias=False)
-        self.w2 = nn.Linear(hidden_dim, params.n_embeddings, bias=False)
-        self.w3 = nn.Linear(params.n_embeddings, hidden_dim, bias=False)
+        self.w1 = nn.Linear(params.dim, hidden_dim, bias=False)
+        self.w2 = nn.Linear(hidden_dim, params.dim, bias=False)
+        self.w3 = nn.Linear(params.dim, hidden_dim, bias=False)
 
         def forward(self, x: torch.tensor):
             # in SwiGLU, the Swish function is used to gate the linear function of GLU
@@ -189,14 +190,14 @@ class TransformerBlock(nn.Module):
         self.ffwd = FeedForward(params)
 
         # normalization before self attention
-        self.attention_norm = RMSNorm(params.n_embeddings, eps=params.norm_eps)
+        self.attention_norm = RMSNorm(params.dim, eps=params.norm_eps)
         # normalization before the feed forward block
-        self.ffwd_norm = RMSNorm(params.n_embeddings, eps=params.norm_eps)
+        self.ffwd_norm = RMSNorm(params.dim, eps=params.norm_eps)
 
         def forward(self, x: torch.tensor, start_pos: int, freqs_complex: torch.tensor):
             # residual connections and root mean square layer normalization
-            h = x + self.attention.forward(self.attention_norm(x), start_pos, freqs_complex) # (B, seq_len, n_embeddings) + (B, seq_len, n_embeddings) --> (B, seq_len, n_embeddings)
-            output = h + self.ffwd.forward(self.ffwd_norm(h))  # (B, seq_len, n_embeddings) + (B, seq_len, n_embeddings) --> (B, seq_len, n_embeddings)
+            h = x + self.attention.forward(self.attention_norm(x), start_pos, freqs_complex) # (B, seq_len, dim) + (B, seq_len, dim) --> (B, seq_len, dim)
+            output = h + self.ffwd.forward(self.ffwd_norm(h))  # (B, seq_len, dim) + (B, seq_len, dim) --> (B, seq_len, dim)
 
             return output
         
@@ -212,33 +213,38 @@ class Transformer(nn.Module):
         self.params = params
         self.vocab_size = params.vocab_size
         self.n_layers = params.n_layers
-        self.tok_embeddings = nn.Embedding(self.vocab_size, params.n_embeddings)
-        self.head_size = self.params.n_embeddings // self.params.n_heads
+        self.tok_embeddings = nn.Embedding(self.vocab_size, params.dim)
+        self.head_size = self.params.dim // self.params.n_heads
 
         # interspersing communcation and computation by replicating the transformer block sequentially  
-        self.layers = nn.Sequential(*[TransformerBlock(self.head_size, params) for _ in range(params.n_layers)])
+        self.layers = torch.nn.ModuleList()
+        for layer_id in range(params.n_layers):
+            self.layers.append(TransformerBlock(layer_id, params))
 
-        self.norm = RMSNorm(params.n_embeddings, eps=params.norm_eps)
-        self.lm_head = nn.Linear(params.n_embeddings, self.vocab_size)
+        # final normalization layer
+        self.norm = RMSNorm(params.dim, eps=params.norm_eps)
+        # final language model head
+        self.output = nn.Linear(params.dim, self.vocab_size)
 
         # note that self.params.max_seq_len is multiplied by 2 because the token limit for the Llama 2 generation of models is 4096
         # adding this multiplier instead of using 4096 directly allows for dynamism of token lengths while training or fine-tuning
-        self.freqs_complex = precompute_freqs_complex(self.head_size, self.params.max_seq_len * 2, device=self.params.device)
+        self.freqs_complex = precompute_freqs_complex(self.head_size, params.max_seq_len * 2, device=self.params.device, theta=params.rope_theta)
 
     def forward(self, tokens: torch.tensor, start_pos: int):
         # tokens is a (batch_size (B), sequence_length (seq_len)) tensor of integers
         B, seq_len = tokens.shape
         assert seq_len == 1, "only one token at a time can be processed"
 
-        x = self.tok_embeddings(tokens) # (B, seq_len) --> (B, seq_len, n_embeddings)
+        x = self.tok_embeddings(tokens) # (B, seq_len) --> (B, seq_len, dim)
 
         # retrieving the pairs (m, theta) corresponding to the positions [start_pos, start_pos + sequence_length]
         freqs_complex = self.freqs_complex[start_pos:start_pos + seq_len]
 
         # sequentially applying all the transformer blocks (decoder layers)
-        x = self.layers(x, start_pos, freqs_complex) # (B, seq_len , n_embeddings)
-        x = self.norm(x) # (B, seq_len , n_embeddings)
-        logits = self.lm_head(x).float() # (B, seq_len, vocab_size)
+        for layer in self.layers:
+            h = self.layers(x, start_pos, freqs_complex) # (B, seq_len , dim)
+        h = self.norm(x) # (B, seq_len , dim)
+        logits = self.output(h).float() # (B, seq_len, vocab_size)
 
         return logits
     
